@@ -1,6 +1,6 @@
 # ReMONET
 
-ReMONET is a powerful tool for regridding and vertical interpolation of geospatial data, designed to work seamlessly with xarray objects. It supports various regridding methods, including nearest neighbor, bilinear, and conservative methods, and provides utilities for vertical regridding.
+ReMONET or Regridding for MONET is a powerful tool for regridding and vertical interpolation of geospatial data, designed to work seamlessly with xarray objects. It supports various regridding methods, including nearest neighbor, bilinear, and conservative methods, and provides utilities for vertical regridding.
 
 ## Features
 
