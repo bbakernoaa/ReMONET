@@ -4,6 +4,7 @@ import esmpy
 from typing import Optional, List, Tuple, Union
 from scipy.spatial import cKDTree
 import dask.array as da
+import dask
 
 try:
     import cf_xarray
@@ -185,3 +186,19 @@ class Regridder:
         regridded_chunk = regrid(srcfield, dstfield)
         return regridded_chunk.data
     
+    def create_weight_file(self) -> str:
+        """
+        Create the ESMF weight file using dask for parallel processing.
+
+        Returns:
+        str: Path to the created weight file.
+        """
+        def compute_weights():
+            srcfield = esmpy.Field(esmpy.Grid(np.array([self.source_lat.values, self.source_lon.values]), staggerloc=esmpy.StaggerLoc.CENTER))
+            dstfield = esmpy.Field(esmpy.Grid(np.array([self.target_lat.values, self.target_lon.values]), staggerloc=esmpy.StaggerLoc.CENTER))
+            regrid = esmpy.Regrid(srcfield=srcfield, dstfield=dstfield, regrid_method=self.method, filename=self.weight_file)
+            regrid(srcfield, dstfield)  # Perform the regridding to generate weights
+            return self.weight_file
+
+        dask.compute(compute_weights)
+        return self.weight_file
