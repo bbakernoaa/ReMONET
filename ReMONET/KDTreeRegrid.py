@@ -1,11 +1,12 @@
 import xarray as xr
 import numpy as np
 from scipy.spatial import cKDTree
-from scipy.interpolate import griddata
+from scipy.interpolate import NearestNDInterpolator, LinearNDInterpolator
 import dask.array as da
-from typing import Tuple
+from typing import Tuple, Union
 from dask import delayed
 import dask
+from scipy import stats
 
 class KDTreeRegrid:
     def __init__(self, source: xr.DataArray, target: xr.DataArray, k: int = 4):
@@ -68,7 +69,7 @@ class KDTreeRegrid:
         dist_dask = da.from_array(np.vstack(dist_list), chunks=(chunks, self.k))
         ind_dask = da.from_array(np.vstack(ind_list), chunks=(chunks, self.k))
 
-        def normalize_weights(dist):
+        def normalize_weights(dist: np.ndarray) -> np.ndarray:
             weights = 1 / dist
             weights /= weights.sum(axis=1, keepdims=True)
             return weights
@@ -84,20 +85,30 @@ class KDTreeRegrid:
         return dist, ind
 
     @staticmethod
-    def resample_block(data_block: np.ndarray, weights: da.Array, indices: da.Array) -> np.ndarray:
+    def resample_block(data_block: np.ndarray, weights: da.Array, indices: da.Array, statistic: str) -> np.ndarray:
         reshaped_block = data_block.reshape((data_block.shape[0], -1))
-        resampled_block = np.sum(reshaped_block[:, indices] * weights[:, :, np.newaxis], axis=1)
+        if statistic == 'mean':
+            resampled_block = np.sum(reshaped_block[:, indices] * weights[:, :, np.newaxis], axis=1)
+        elif statistic == 'median':
+            resampled_block = np.median(reshaped_block[:, indices], axis=1)
+        elif statistic == 'mode':
+            mode_result = stats.mode(reshaped_block[:, indices], axis=1, nan_policy='omit')
+            resampled_block = mode_result.mode
+        elif statistic == 'std':
+            resampled_block = np.std(reshaped_block[:, indices], axis=1)
+        else:
+            raise ValueError("Unsupported statistic. Use 'mean', 'median', 'mode', or 'std'.")
         return resampled_block
 
-    def resample_data_dask(self) -> xr.DataArray:
+    def resample_data_dask(self, statistic: str = 'mean') -> xr.DataArray:
         weights_dask, indices_dask = self.generate_weights_indices_dask()
 
         data_dask = self.source.chunk({self.lat_dim: self.source[self.lat_dim].size//2, self.lon_dim: self.source[self.lon_dim].size//2})
 
-        def handle_nan(data_block, weights, indices):
+        def handle_nan(data_block: np.ndarray, weights: da.Array, indices: da.Array) -> np.ndarray:
             mask = np.isnan(data_block)
             data_block = np.ma.masked_array(data_block, mask)
-            resampled_block = self.resample_block(data_block, weights, indices)
+            resampled_block = self.resample_block(data_block, weights, indices, statistic)
             return np.ma.filled(resampled_block, np.nan)
 
         resampled_data = data_dask.map_blocks(
@@ -113,7 +124,7 @@ class KDTreeRegrid:
 
         return resampled_data
 
-    def save_weights(self, weights: da.Array, indices: da.Array, filename: str):
+    def save_weights(self, weights: da.Array, indices: da.Array, filename: str) -> None:
         weights = weights.compute()
         indices = indices.compute()
         ds = xr.Dataset({
@@ -140,13 +151,27 @@ class KDTreeRegrid:
         data_values = data_values[mask]
         source_points = source_points[mask]
 
-        interpolated_values = griddata(source_points, data_values, target_points, method=method)
+        if method == 'linear':
+            interpolator = LinearNDInterpolator(source_points, data_values)
+        elif method == 'nearest':
+            interpolator = NearestNDInterpolator(source_points, data_values)
+        else:
+            raise ValueError("Unsupported interpolation method. Use 'linear' or 'nearest'.")
 
+        def parallel_interpolation(chunk):
+            return interpolator(chunk)
+
+        target_points_dask = da.from_array(target_points, chunks=(len(target_points) // dask.config.get('scheduler')['num_workers'], 3))
+        interpolated_values_dask = da.map_blocks(parallel_interpolation, target_points_dask, dtype=float)
+
+        interpolated_values = interpolated_values_dask.compute()
         interpolated_data = interpolated_values.reshape(self.lat_tgt.shape)
 
         return xr.DataArray(interpolated_data, dims=[self.lat_dim, self.lon_dim], coords={self.lat_dim: self.lat_tgt[:, 0], self.lon_dim: self.lon_tgt[0, :]}, attrs=self.source.attrs)
 
 # Example usage:
+lat_src = np.array([[10, 20], [30, 40]])  # Source latitudes (2D array)
+lon_src = np.array([[30, 40], [50, 60]])  # Source longitudes 
 lat_src = np.array([[10, 20], [30, 40]])  # Source latitudes (2D array)
 lon_src = np.array([[30, 40], [50, 60]])  # Source longitudes (2D array)
 lat_tgt = np.array([[15, 25], [35, 45]])  # Target latitudes (2D array)
