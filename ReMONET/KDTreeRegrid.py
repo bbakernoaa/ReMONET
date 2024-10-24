@@ -1,5 +1,6 @@
 import xarray as xr
 import numpy as np
+import numpy.ma as ma
 from scipy.spatial import cKDTree
 from scipy.interpolate import NearestNDInterpolator, LinearNDInterpolator
 import dask.array as da
@@ -61,7 +62,7 @@ class KDTreeRegrid:
 
         num_workers = dask.config.get('scheduler')['num_workers']
         chunks = len(target_points) // num_workers if num_workers else len(target_points)
-        dask_tasks = [delayed(self.parallel_weight_generation)(source_points, target_points[i:i + chunks], self.k) 
+        dask_tasks = [delayed(self.parallel_weight_generation)(source_points, target_points[i:i + chunks], self.k)
                       for i in range(0, len(target_points), chunks)]
         results = dask.compute(*dask_tasks)
 
@@ -117,7 +118,7 @@ class KDTreeRegrid:
         )
 
         resampled_data = xr.DataArray(
-            resampled_data, dims=[self.lat_dim, self.lon_dim] + list(self.source.dims[2:]), 
+            resampled_data, dims=[self.lat_dim, self.lon_dim] + list(self.source.dims[2:]),
             coords={self.lat_dim: self.lat_tgt[:, 0], self.lon_dim: self.lon_tgt[0, :]},
             attrs=self.source.attrs  # Retain attributes
         )
@@ -139,39 +140,47 @@ class KDTreeRegrid:
         indices = da.from_array(ds['indices'].values, chunks=ds['indices'].shape)
         return weights, indices
 
-    def interpolate_scipy(self, method: str = 'linear') -> xr.DataArray:
-        x_src, y_src, z_src = self.latlon_to_cartesian(self.source[self.lat_dim].values.ravel(), self.source[self.lon_dim].values.ravel())
-        x_tgt, y_tgt, z_tgt = self.latlon_to_cartesian(self.lat_tgt.ravel(), self.lon_tgt.ravel())
 
-        source_points = np.vstack([x_src, y_src, z_src]).T
-        target_points = np.vstack([x_tgt, y_tgt, z_tgt]).T
 
-        data_values = self.source.values.ravel()
-        mask = ~np.isnan(data_values)
-        data_values = data_values[mask]
-        source_points = source_points[mask]
+def interpolate_scipy(self, method: str = 'linear') -> xr.DataArray:
+    x_src, y_src, z_src = self.latlon_to_cartesian(np.asarray(self.source[self.lat_dim].values).ravel(), np.asarray(self.source[self.lon_dim].values).ravel())
+    x_tgt, y_tgt, z_tgt = self.latlon_to_cartesian(self.lat_tgt.ravel(), self.lon_tgt.ravel())
 
-        if method == 'linear':
-            interpolator = LinearNDInterpolator(source_points, data_values)
-        elif method == 'nearest':
-            interpolator = NearestNDInterpolator(source_points, data_values)
+    source_points = np.vstack([x_src, y_src, z_src]).T
+    target_points = np.vstack([x_tgt, y_tgt, z_tgt]).T
+
+    data_values = da.from_array(np.asarray(self.source.values).ravel(), chunks=self.source.values.size//2)
+    mask = ~np.isnan(data_values)
+    data_values = data_values[mask]
+    source_points = source_points[mask]
+
+    # Handle masked arrays
+    if isinstance(data_values, ma.MaskedArray):
+        mask = ~data_values.mask
+        data_values = data_values.data[mask]
+
+    # Flatten additional dimensions in data values
+    data_values_flat = data_values.reshape(data_values.shape[0], -1)
+
+    try:
+        if method == 'nearest':
+            tree = cKDTree(source_points)
+            _, indices = tree.query(target_points, k=1)
+            interpolated_data = self.source.values.ravel()[indices].reshape(self.lat_tgt.shape)
         else:
-            raise ValueError("Unsupported interpolation method. Use 'linear' or 'nearest'.")
+            interpolated_values = griddata(source_points, data_values_flat, target_points, method=method)
+            interpolated_data = interpolated_values.reshape(self.lat_tgt.shape)
+    except ValueError as e:
+        print(f"Interpolation error: {e}")
+        interpolated_data = np.full(self.lat_tgt.shape, np.nan)
 
-        def parallel_interpolation(chunk):
-            return interpolator(chunk)
-
-        target_points_dask = da.from_array(target_points, chunks=(len(target_points) // dask.config.get('scheduler')['num_workers'], 3))
-        interpolated_values_dask = da.map_blocks(parallel_interpolation, target_points_dask, dtype=float)
-
-        interpolated_values = interpolated_values_dask.compute()
-        interpolated_data = interpolated_values.reshape(self.lat_tgt.shape)
-
+    if self.source.attrs is not None:
         return xr.DataArray(interpolated_data, dims=[self.lat_dim, self.lon_dim], coords={self.lat_dim: self.lat_tgt[:, 0], self.lon_dim: self.lon_tgt[0, :]}, attrs=self.source.attrs)
-
+    else:
+        return xr.DataArray(interpolated_data, dims=[self.lat_dim, self.lon_dim], coords={self.lat_dim: self.lat_tgt[:, 0], self.lon_dim: self.lon_tgt[0, :]})
 # Example usage:
 lat_src = np.array([[10, 20], [30, 40]])  # Source latitudes (2D array)
-lon_src = np.array([[30, 40], [50, 60]])  # Source longitudes 
+lon_src = np.array([[30, 40], [50, 60]])  # Source longitudes
 lat_src = np.array([[10, 20], [30, 40]])  # Source latitudes (2D array)
 lon_src = np.array([[30, 40], [50, 60]])  # Source longitudes (2D array)
 lat_tgt = np.array([[15, 25], [35, 45]])  # Target latitudes (2D array)
@@ -183,4 +192,4 @@ data_4d = xr.DataArray(np.random.rand(2, 2, 3, 4), dims=["lat", "lon", "z", "tim
 
 regridder = KDTreeRegrid(data_2d, data_2d)
 weights, indices = regridder.generate_weights_indices_dask()
-regridder.save_weights(weights, indices
+# regridder.save_weights(weights, indices
