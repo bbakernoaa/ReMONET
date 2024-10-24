@@ -1,6 +1,7 @@
 import xarray as xr
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.interpolate import griddata
 import dask.array as da
 from typing import Tuple
 from dask import delayed
@@ -93,27 +94,26 @@ class KDTreeRegrid:
 
         data_dask = self.source.chunk({self.lat_dim: self.source[self.lat_dim].size//2, self.lon_dim: self.source[self.lon_dim].size//2})
 
+        def handle_nan(data_block, weights, indices):
+            mask = np.isnan(data_block)
+            data_block = np.ma.masked_array(data_block, mask)
+            resampled_block = self.resample_block(data_block, weights, indices)
+            return np.ma.filled(resampled_block, np.nan)
+
         resampled_data = data_dask.map_blocks(
-            self.resample_block, weights_dask, indices_dask,
+            handle_nan, weights_dask, indices_dask,
             dtype=self.source.dtype, drop_axis=[0, 1]
         )
 
         resampled_data = xr.DataArray(
             resampled_data, dims=[self.lat_dim, self.lon_dim] + list(self.source.dims[2:]), 
-            coords={self.lat_dim: self.lat_tgt[:, 0], self.lon_dim: self.lon_tgt[0, :]}
+            coords={self.lat_dim: self.lat_tgt[:, 0], self.lon_dim: self.lon_tgt[0, :]},
+            attrs=self.source.attrs  # Retain attributes
         )
 
         return resampled_data
 
     def save_weights(self, weights: da.Array, indices: da.Array, filename: str):
-        """
-        Save the weights and indices to a NetCDF file.
-
-        Parameters:
-        - weights (da.Array): The weights array.
-        - indices (da.Array): The indices array.
-        - filename (str): The filename to save the NetCDF file.
-        """
         weights = weights.compute()
         indices = indices.compute()
         ds = xr.Dataset({
@@ -123,19 +123,28 @@ class KDTreeRegrid:
         ds.to_netcdf(filename)
 
     def load_weights(self, filename: str) -> Tuple[da.Array, da.Array]:
-        """
-        Load the weights and indices from a NetCDF file.
-
-        Parameters:
-        - filename (str): The filename of the NetCDF file.
-
-        Returns:
-        - Tuple[da.Array, da.Array]: The weights and indices arrays.
-        """
         ds = xr.open_dataset(filename)
         weights = da.from_array(ds['weights'].values, chunks=ds['weights'].shape)
         indices = da.from_array(ds['indices'].values, chunks=ds['indices'].shape)
         return weights, indices
+
+    def interpolate_scipy(self, method: str = 'linear') -> xr.DataArray:
+        x_src, y_src, z_src = self.latlon_to_cartesian(self.source[self.lat_dim].values.ravel(), self.source[self.lon_dim].values.ravel())
+        x_tgt, y_tgt, z_tgt = self.latlon_to_cartesian(self.lat_tgt.ravel(), self.lon_tgt.ravel())
+
+        source_points = np.vstack([x_src, y_src, z_src]).T
+        target_points = np.vstack([x_tgt, y_tgt, z_tgt]).T
+
+        data_values = self.source.values.ravel()
+        mask = ~np.isnan(data_values)
+        data_values = data_values[mask]
+        source_points = source_points[mask]
+
+        interpolated_values = griddata(source_points, data_values, target_points, method=method)
+
+        interpolated_data = interpolated_values.reshape(self.lat_tgt.shape)
+
+        return xr.DataArray(interpolated_data, dims=[self.lat_dim, self.lon_dim], coords={self.lat_dim: self.lat_tgt[:, 0], self.lon_dim: self.lon_tgt[0, :]}, attrs=self.source.attrs)
 
 # Example usage:
 lat_src = np.array([[10, 20], [30, 40]])  # Source latitudes (2D array)
@@ -149,21 +158,4 @@ data_4d = xr.DataArray(np.random.rand(2, 2, 3, 4), dims=["lat", "lon", "z", "tim
 
 regridder = KDTreeRegrid(data_2d, data_2d)
 weights, indices = regridder.generate_weights_indices_dask()
-regridder.save_weights(weights, indices, 'weights_indices_2d.nc')
-loaded_weights, loaded_indices = regridder.load_weights('weights_indices_2d.nc')
-resampled_data_2d = regridder.resample_data_dask()
-print(resampled_data_2d)
-
-regridder = KDTreeRegrid(data_3d, data_3d)
-weights, indices = regridder.generate_weights_indices_dask()
-regridder.save_weights(weights, indices, 'weights_indices_3d.nc')
-loaded_weights, loaded_indices = regridder.load_weights('weights_indices_3d.nc')
-resampled_data_3d = regridder.resample_data_dask()
-print(resampled_data_3d)
-
-regridder = KDTreeRegrid(data_4d, data_4d)
-weights, indices = regridder.generate_weights_indices_dask()
-regridder.save_weights(weights, indices, 'weights_indices_4d.nc')
-loaded_weights, loaded_indices = regridder.load_weights('weights_indices_4d.nc')
-resampled_data_4d = regridder.resample_data_dask()
-print(resampled
+regridder.save_weights(weights, indices
